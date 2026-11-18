@@ -253,6 +253,7 @@ final class ApiClient {
 		$maxBackOffWindow = 300;
 		$initialSleep = 1;
 		$currentBackOffWindow = $initialSleep;
+		$hasRenewedToken = false;
 
 		for ($attemptNum = 0; $attemptNum < $maxAttempts; $attemptNum++) {
 			$sleep_time = rand($initialSleep, $currentBackOffWindow);
@@ -277,10 +278,30 @@ final class ApiClient {
 					$sleep_time = 120;
 					break;
 
+				case 401:
+					$tokenConfig = $GLOBALS['offline_token_refresh_config'] ?? [];
+					$enabledTokenRefresh = $tokenConfig['enabled'] ?? false;
+					if ($enabledTokenRefresh === true) {
+						if ($hasRenewedToken) {
+							// Token was already renewed once, so don't retry again.
+							break 2;
+						}
+						$tokenRequestPayload = ['shop' => $this->shop];
+						$newAccessToken = $this->renewToken($tokenRequestPayload);
+						if (!$newAccessToken) {
+							// Token renewal failed, stop retrying.
+							break 2;
+						}
+						$this->setOauthToken($newAccessToken);
+						$params[RequestOptions::HEADERS]['X-Shopify-Access-Token'] = $this->token;
+						$hasRenewedToken = true;
+						// Retry immediately with the renewed token.
+						continue 2;
+					}
 				// Hard fail errors, skip retrying
 				case 303: // See Other
 				case 400: // Bad Request
-				case 401: // Unauthorized
+				// case 401: // Unauthorized
 				case 402: // Payment Required
 				case 403: // Forbidden
 				case 404: // Not Found
@@ -293,14 +314,68 @@ final class ApiClient {
 				case 503: // Service Unavailable
 					break 2;
 			}
-
 			sleep($sleep_time);
 			$currentBackOffWindow = min($maxBackOffWindow, $currentBackOffWindow * 2);
 		}
-
 		$this->lastResponseHeaders = array_change_key_case($response->getHeaders(), CASE_LOWER);
 		return $response;
 	}
 
+	private function renewToken(array $tokenRequestParams): ?string
+	{
+		$tokenConfig = $GLOBALS['offline_token_refresh_config'] ?? [];
+		$enabledTokenRefresh = $tokenConfig['enabled'] ?? false;
+
+		if ($enabledTokenRefresh !== true) {
+			return null;
+		}
+
+		if (!$tokenConfig) {
+			return null;
+		}
+
+		$apiUrl = $tokenConfig['endpoint'] ?? '';
+		$apiKey = $tokenConfig['api_key'] ?? '';
+
+		if (empty($apiUrl) || empty($apiKey)) {
+			return null;
+		}
+
+		$request = new Request('POST', $apiUrl);
+
+		$params = [
+			RequestOptions::HEADERS => [
+				'Content-Type' => 'application/json',
+				'X-Connector-Key' => $apiKey,
+			],
+			RequestOptions::JSON => $tokenRequestParams,
+		];
+
+		try {
+			$response = $this->client->send($request, $params);
+		} catch (\Throwable $e) {
+			return null;
+		}
+
+		$httpStatus = $response->getStatusCode();
+
+		if ($httpStatus < 200 || $httpStatus >= 300) {
+			return null;
+		}
+
+		$responseBody = $response->getBody()->getContents();
+		$responseData = json_decode($responseBody, true);
+
+		if (
+			!is_array($responseData) ||
+			!isset($responseData['access_token']) ||
+			!is_string($responseData['access_token']) ||
+			$responseData['access_token'] === ''
+		) {
+			return null;
+		}
+
+		return $responseData['access_token'];
+	}
 }
 
